@@ -19,12 +19,13 @@ import threading
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-DAYS_BACK = 30  # How many days to look back for 8-K filings
+DAYS_BACK = 7  # How many days to look back for 8-K filings
 OUTPUT_FILENAME = "exhibit_99_1_filings.csv"
 USER_AGENT = "Mozilla/5.0 (SEC Exhibit Extractor; brendanwbhan@gmail.com)"  # REQUIRED by SEC
 REQUEST_DELAY = 0.11  # 0.11 seconds = ~9 requests/second (under SEC limit)
 MAX_RETRIES = 3
 MAX_WORKERS = 8  # Number of parallel threads for processing filings
+MIN_OPTIONS_VOLUME = 10000  # Minimum daily options volume to include stock
 
 # SEC EDGAR API endpoints
 SEC_BASE_URL = "https://www.sec.gov"
@@ -47,8 +48,14 @@ def get_sec_headers():
     }
 
 def rate_limit():
-    """Enforce rate limiting to comply with SEC guidelines"""
-    time.sleep(REQUEST_DELAY)
+    """Enforce rate limiting to comply with SEC guidelines (thread-safe)"""
+    global last_request_time
+    with rate_limit_lock:
+        current_time = time.time()
+        time_since_last = current_time - last_request_time
+        if time_since_last < REQUEST_DELAY:
+            time.sleep(REQUEST_DELAY - time_since_last)
+        last_request_time = time.time()
 
 def parse_date(date_str: str) -> str:
     """Convert various date formats to YYYY-MM-DD"""
@@ -87,7 +94,7 @@ def get_company_tickers() -> Dict:
 
 def get_recent_8k_filings(days_back: int = 30) -> List[Dict]:
     """
-    Fetch recent 8-K filings from SEC EDGAR using the RSS feed
+    Fetch recent 8-K filings from SEC EDGAR using daily index files
 
     Args:
         days_back: Number of days to look back for filings
@@ -99,15 +106,32 @@ def get_recent_8k_filings(days_back: int = 30) -> List[Dict]:
     cutoff_date = datetime.now() - timedelta(days=days_back)
 
     print(f"Searching for 8-K filings from {cutoff_date.strftime('%Y-%m-%d')} to {datetime.now().strftime('%Y-%m-%d')}...")
+    print("Using SEC daily index files for comprehensive coverage...")
 
-    # Use SEC's RSS feed for recent filings
-    # The RSS feed provides the most recent filings across all companies
+    # Use daily index files for maximum coverage
+    filings = get_filings_from_daily_index(days_back)
+
+    if not filings:
+        print("  Daily index method failed, trying RSS feed...")
+        # Fallback to RSS feed if daily index fails
+        filings = get_filings_from_rss_feed()
+
+    return filings
+
+def get_filings_from_rss_feed() -> List[Dict]:
+    """
+    Fetch recent 8-K filings from SEC's RSS feed (limited to ~100 most recent)
+
+    Returns:
+        List of filing dictionaries
+    """
+    filings = []
     url = f"{SEC_BASE_URL}/cgi-bin/browse-edgar"
 
     params = {
         "action": "getcurrent",
         "type": "8-K",
-        "count": "100",  # Max per request
+        "count": "100",
         "output": "atom"
     }
 
@@ -117,38 +141,23 @@ def get_recent_8k_filings(days_back: int = 30) -> List[Dict]:
         response.raise_for_status()
 
         content = response.text
-
-        # Parse the Atom feed for filing entries
         entries = re.findall(r'<entry>(.*?)</entry>', content, re.DOTALL)
 
-        print(f"  Found {len(entries)} recent 8-K filings")
+        print(f"  Found {len(entries)} recent 8-K filings from RSS feed")
 
         for entry in entries:
             filing_data = parse_atom_entry(entry)
             if filing_data:
-                # Check if filing is within our date range
-                try:
-                    filing_date = datetime.strptime(filing_data['filing_date'], '%Y-%m-%d')
-                    if filing_date >= cutoff_date:
-                        filings.append(filing_data)
-                except:
-                    # If date parsing fails, include it anyway
-                    filings.append(filing_data)
-
-        print(f"Total 8-K filings in date range: {len(filings)}")
+                filings.append(filing_data)
 
     except Exception as e:
-        print(f"  Error fetching filings: {e}")
-        print(f"  Trying alternative method...")
-
-        # Fallback: Try to get recent filings by checking the daily index files
-        filings = get_filings_from_daily_index(days_back)
+        print(f"  Error fetching RSS feed: {e}")
 
     return filings
 
 def get_filings_from_daily_index(days_back: int = 30) -> List[Dict]:
     """
-    Fetch 8-K filings from SEC's daily index files
+    Fetch 8-K filings from SEC's daily index files (optimized with parallel downloads)
 
     Args:
         days_back: Number of days to look back
@@ -159,14 +168,19 @@ def get_filings_from_daily_index(days_back: int = 30) -> List[Dict]:
     filings = []
     print("  Using daily index files method...")
 
-    # Iterate through each day in the range
+    # Generate list of dates to check (skip weekends)
+    dates_to_check = []
     for day_offset in range(days_back):
         date = datetime.now() - timedelta(days=day_offset)
-
         # Skip weekends
-        if date.weekday() >= 5:
-            continue
+        if date.weekday() < 5:
+            dates_to_check.append(date)
 
+    print(f"  Checking {len(dates_to_check)} business days...")
+
+    def fetch_daily_index(date: datetime) -> List[Dict]:
+        """Fetch a single day's index"""
+        daily_filings = []
         year = date.strftime("%Y")
         quarter = f"QTR{(date.month - 1) // 3 + 1}"
         date_str = date.strftime("%Y%m%d")
@@ -198,20 +212,34 @@ def get_filings_from_daily_index(days_back: int = 30) -> List[Dict]:
 
                             filing_url = f"{SEC_BASE_URL}/Archives/edgar/data/{cik}/{accession_no_dashes}/{accession}-index.htm"
 
-                            filings.append({
+                            daily_filings.append({
                                 "company_name": company_name,
                                 "cik": cik,
                                 "filing_date": filing_date,
                                 "accession": accession_no_dashes,
                                 "filing_url": filing_url
                             })
-
-                if day_offset % 5 == 0:
-                    print(f"    Processed {day_offset + 1}/{days_back} days, found {len(filings)} filings so far...")
-
         except Exception as e:
             # It's normal for some dates to not have index files (holidays, etc.)
             pass
+
+        return daily_filings
+
+    # Fetch daily indices in parallel (limited parallelism for rate limiting)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_to_date = {executor.submit(fetch_daily_index, date): date for date in dates_to_check}
+
+        processed = 0
+        for future in as_completed(future_to_date):
+            processed += 1
+            try:
+                daily_filings = future.result()
+                filings.extend(daily_filings)
+
+                if processed % 5 == 0 or processed == len(dates_to_check):
+                    print(f"    Processed {processed}/{len(dates_to_check)} days, found {len(filings)} filings so far...")
+            except Exception as e:
+                pass
 
     print(f"  Total 8-K filings found from daily index: {len(filings)}")
     return filings
@@ -283,6 +311,53 @@ def get_ticker_from_cik(cik: str) -> str:
         return ""
     except:
         return ""
+
+def get_options_volume(ticker: str) -> int:
+    """
+    Get the average daily options volume for a ticker
+
+    Args:
+        ticker: Stock ticker symbol
+
+    Returns:
+        Average daily options volume, or 0 if unavailable
+    """
+    if not ticker:
+        return 0
+
+    try:
+        import yfinance as yf
+
+        # Get stock data
+        stock = yf.Ticker(ticker)
+
+        # Try to get options data
+        try:
+            # Get available expiration dates
+            exp_dates = stock.options
+            if not exp_dates:
+                return 0
+
+            # Get the nearest expiration date
+            nearest_exp = exp_dates[0]
+
+            # Get option chain for nearest expiration
+            opt_chain = stock.option_chain(nearest_exp)
+
+            # Calculate total volume from calls and puts
+            calls_volume = opt_chain.calls['volume'].sum() if 'volume' in opt_chain.calls else 0
+            puts_volume = opt_chain.puts['volume'].sum() if 'volume' in opt_chain.puts else 0
+
+            total_volume = int(calls_volume + puts_volume)
+            return total_volume
+
+        except:
+            # If options data unavailable, return 0
+            return 0
+
+    except Exception as e:
+        # If any error occurs, return 0 (assume no options or unavailable)
+        return 0
 
 def find_exhibit_99_1(cik: str, accession: str, filing_url: str) -> Optional[str]:
     """
@@ -397,6 +472,7 @@ def write_to_csv(data: List[Dict], filename: str):
         "Company Name",
         "CIK Number",
         "Ticker Symbol",
+        "Options Volume",
         "Filing Date",
         "Exhibit 99.1 URL",
         "Filing Accession Number"
@@ -412,6 +488,7 @@ def write_to_csv(data: List[Dict], filename: str):
                     "Company Name": row.get("company_name", ""),
                     "CIK Number": row.get("cik", ""),
                     "Ticker Symbol": row.get("ticker", ""),
+                    "Options Volume": row.get("options_volume", 0),
                     "Filing Date": row.get("filing_date", ""),
                     "Exhibit 99.1 URL": row.get("exhibit_url", ""),
                     "Filing Accession Number": row.get("accession", "")
@@ -424,13 +501,75 @@ def write_to_csv(data: List[Dict], filename: str):
         sys.exit(1)
 
 # ============================================================================
+# PARALLEL PROCESSING
+# ============================================================================
+
+def process_single_filing(filing: Dict, idx: int, total: int) -> Optional[Dict]:
+    """
+    Process a single filing to find Exhibit 99.1 and check options volume (for parallel execution)
+
+    Args:
+        filing: Filing dictionary
+        idx: Current index (for progress tracking)
+        total: Total number of filings
+
+    Returns:
+        Result dictionary if Exhibit 99.1 found and options volume >= MIN_OPTIONS_VOLUME, None otherwise
+    """
+    company_name_short = filing['company_name'][:50] if len(filing['company_name']) > 50 else filing['company_name']
+
+    # Find Exhibit 99.1
+    exhibit_url = find_exhibit_99_1(
+        filing['cik'],
+        filing['accession'],
+        filing['filing_url']
+    )
+
+    if exhibit_url:
+        # Get ticker symbol (required for options volume check)
+        ticker = get_ticker_from_cik(filing['cik'])
+
+        if not ticker:
+            # Skip if no ticker found (can't check options volume)
+            if idx % 20 == 0:
+                print(f"  [{idx}/{total}] ✗ {company_name_short} (no ticker)")
+            return None
+
+        # Get options volume
+        options_volume = get_options_volume(ticker)
+
+        # Filter by minimum options volume
+        if options_volume >= MIN_OPTIONS_VOLUME:
+            print(f"  [{idx}/{total}] ✓ {ticker} - {company_name_short} (Options Vol: {options_volume:,})")
+
+            return {
+                "company_name": filing['company_name'],
+                "cik": filing['cik'],
+                "ticker": ticker,
+                "filing_date": parse_date(filing['filing_date']),
+                "exhibit_url": exhibit_url,
+                "accession": filing['accession'],
+                "options_volume": options_volume
+            }
+        else:
+            # Filtered out due to low options volume
+            if idx % 20 == 0:
+                print(f"  [{idx}/{total}] ✗ {ticker} (Options Vol: {options_volume:,} < {MIN_OPTIONS_VOLUME:,})")
+            return None
+    else:
+        # Only print occasionally to reduce noise
+        if idx % 50 == 0:
+            print(f"  [{idx}/{total}] Processing...")
+        return None
+
+# ============================================================================
 # MAIN WORKFLOW
 # ============================================================================
 
 def main():
-    """Main execution function"""
+    """Main execution function with parallel processing"""
     print("=" * 70)
-    print("SEC EDGAR 8-K Exhibit 99.1 Extractor")
+    print("SEC EDGAR 8-K Exhibit 99.1 Extractor (Parallel Mode)")
     print("=" * 70)
     print()
 
@@ -441,50 +580,57 @@ def main():
         print("\nNo 8-K filings found in the specified date range.")
         sys.exit(0)
 
-    # Step 2: Process each filing to find Exhibit 99.1
-    print(f"\nProcessing {len(filings)} filings to locate Exhibit 99.1...")
+    # Step 2: Process filings in parallel to find Exhibit 99.1
+    print(f"\nProcessing {len(filings)} filings with {MAX_WORKERS} parallel workers...")
+    print("This may take a few minutes depending on the number of filings...\n")
+
     results = []
+    processed_count = 0
 
-    for idx, filing in enumerate(filings, 1):
-        print(f"  [{idx}/{len(filings)}] Processing {filing['company_name'][:50]}...", end="")
+    # Use ThreadPoolExecutor for parallel processing
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all tasks
+        future_to_filing = {
+            executor.submit(process_single_filing, filing, idx, len(filings)): filing
+            for idx, filing in enumerate(filings, 1)
+        }
 
-        # Find Exhibit 99.1
-        exhibit_url = find_exhibit_99_1(
-            filing['cik'],
-            filing['accession'],
-            filing['filing_url']
-        )
+        # Collect results as they complete
+        for future in as_completed(future_to_filing):
+            processed_count += 1
+            try:
+                result = future.result()
+                if result:
+                    results.append(result)
+            except Exception as e:
+                # Silently skip errors in individual filings
+                pass
 
-        if exhibit_url:
-            print(" ✓ Found")
-
-            # Get ticker (optional, may be slow)
-            # ticker = get_ticker_from_cik(filing['cik'])
-            ticker = ""  # Comment out above line and uncomment this to skip ticker lookup
-
-            results.append({
-                "company_name": filing['company_name'],
-                "cik": filing['cik'],
-                "ticker": ticker,
-                "filing_date": parse_date(filing['filing_date']),
-                "exhibit_url": exhibit_url,
-                "accession": filing['accession']
-            })
-        else:
-            print(" ✗ Not found")
+            # Print progress update every 50 filings
+            if processed_count % 50 == 0:
+                print(f"  Progress: {processed_count}/{len(filings)} filings processed, {len(results)} with Exhibit 99.1")
 
     # Step 3: Write results to CSV
-    print(f"\nFound Exhibit 99.1 in {len(results)} out of {len(filings)} filings")
+    print(f"\n{'=' * 70}")
+    print(f"FILTERING SUMMARY:")
+    print(f"  Total 8-K filings: {len(filings)}")
+    print(f"  Filings with Exhibit 99.1 and options volume >= {MIN_OPTIONS_VOLUME:,}: {len(results)}")
+    print(f"  Success rate: {len(results)/len(filings)*100:.1f}%")
 
     if results:
+        # Sort results by options volume (highest first)
+        results.sort(key=lambda x: x.get('options_volume', 0), reverse=True)
+
         write_to_csv(results, OUTPUT_FILENAME)
-        print(f"\nSample output:")
-        print(f"  Company: {results[0]['company_name']}")
-        print(f"  CIK: {results[0]['cik']}")
-        print(f"  Date: {results[0]['filing_date']}")
-        print(f"  URL: {results[0]['exhibit_url'][:70]}...")
+        print(f"\nTop 5 results by options volume:")
+        for i, result in enumerate(results[:5], 1):
+            print(f"\n  {i}. {result['ticker']} - {result['company_name']}")
+            print(f"     Options Volume: {result.get('options_volume', 0):,}")
+            print(f"     Filing Date: {result['filing_date']}")
+            print(f"     URL: {result['exhibit_url'][:60]}...")
     else:
-        print("\nNo filings with Exhibit 99.1 found.")
+        print(f"\nNo filings found with Exhibit 99.1 and options volume >= {MIN_OPTIONS_VOLUME:,}.")
+        print(f"Consider lowering MIN_OPTIONS_VOLUME in the configuration.")
 
     print("\n" + "=" * 70)
     print("Processing complete!")
