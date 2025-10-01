@@ -19,13 +19,13 @@ import threading
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-DAYS_BACK = 7  # How many days to look back for 8-K filings
+DAYS_BACK = 14  # How many days to look back for 8-K filings
 OUTPUT_FILENAME = "exhibit_99_1_filings.csv"
 USER_AGENT = "Mozilla/5.0 (SEC Exhibit Extractor; brendanwbhan@gmail.com)"  # REQUIRED by SEC
 REQUEST_DELAY = 0.11  # 0.11 seconds = ~9 requests/second (under SEC limit)
 MAX_RETRIES = 3
 MAX_WORKERS = 8  # Number of parallel threads for processing filings
-MIN_OPTIONS_VOLUME = 10000  # Minimum daily options volume to include stock
+MIN_OPTIONS_VOLUME = 0  # Minimum daily options volume to include stock
 
 # SEC EDGAR API endpoints
 SEC_BASE_URL = "https://www.sec.gov"
@@ -34,6 +34,10 @@ SEC_DATA_URL = "https://data.sec.gov"
 # Thread-safe rate limiting
 rate_limit_lock = threading.Lock()
 last_request_time = 0
+
+# Cache for company tickers (load once at startup)
+TICKER_CACHE = {}
+TICKER_CACHE_LOADED = False
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -75,22 +79,46 @@ def parse_date(date_str: str) -> str:
 # SEC EDGAR DATA EXTRACTION
 # ============================================================================
 
-def get_company_tickers() -> Dict:
+def load_ticker_cache():
     """
-    Fetch the company tickers JSON file from SEC
+    Load the SEC company tickers file into cache (CIK -> Ticker mapping)
+    This is called once at startup to avoid repeated API calls
+    """
+    global TICKER_CACHE, TICKER_CACHE_LOADED
 
-    Returns:
-        Dictionary mapping CIK to company info
-    """
+    if TICKER_CACHE_LOADED:
+        return
+
     try:
-        rate_limit()
+        print("Loading SEC company ticker cache...")
         url = f"{SEC_DATA_URL}/files/company_tickers.json"
-        response = requests.get(url, headers=get_sec_headers(), timeout=30)
+
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept-Encoding": "gzip, deflate",
+            "Host": "data.sec.gov"
+        }
+
+        response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
-        return response.json()
+
+        data = response.json()
+
+        # Structure: {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}, ...}
+        for key, company in data.items():
+            if isinstance(company, dict):
+                cik_str = str(company.get("cik_str", "")).zfill(10)
+                ticker = company.get("ticker", "")
+                if cik_str and ticker:
+                    TICKER_CACHE[cik_str] = ticker.upper()
+
+        TICKER_CACHE_LOADED = True
+        print(f"✓ Loaded {len(TICKER_CACHE)} company tickers into cache")
+
     except Exception as e:
-        print(f"Warning: Could not fetch company tickers: {e}")
-        return {}
+        print(f"⚠️  Warning: Could not load ticker cache: {e}")
+        print("   Ticker lookups will use slower API method")
+        TICKER_CACHE_LOADED = True  # Don't try again
 
 def get_recent_8k_filings(days_back: int = 30) -> List[Dict]:
     """
@@ -290,7 +318,7 @@ def parse_atom_entry(entry_xml: str) -> Optional[Dict]:
 
 def get_ticker_from_cik(cik: str) -> str:
     """
-    Attempt to retrieve ticker symbol for a given CIK
+    Retrieve ticker symbol for a given CIK using cache-first approach
 
     Args:
         cik: Company CIK number
@@ -298,18 +326,51 @@ def get_ticker_from_cik(cik: str) -> str:
     Returns:
         Ticker symbol or empty string if not found
     """
+    if not cik or not cik.strip():
+        return ""
+
+    cik_padded = cik.strip().zfill(10)
+
+    # Method 1: Check cache first (FASTEST - no API call)
+    if cik_padded in TICKER_CACHE:
+        return TICKER_CACHE[cik_padded]
+
+    # Method 2: Try API lookup as fallback (slower)
     try:
         rate_limit()
-        # Use SEC's company information endpoint
-        url = f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
-        response = requests.get(url, headers=get_sec_headers(), timeout=10)
+        url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
+
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept-Encoding": "gzip, deflate",
+            "Host": "data.sec.gov"
+        }
+
+        response = requests.get(url, headers=headers, timeout=10)
 
         if response.status_code == 200:
             data = response.json()
-            tickers = data.get("tickers", [])
-            return tickers[0] if tickers else ""
+
+            # Check "tickers" array
+            if "tickers" in data and isinstance(data["tickers"], list) and len(data["tickers"]) > 0:
+                ticker = data["tickers"][0]
+                if ticker and isinstance(ticker, str) and len(ticker) <= 10:
+                    ticker_upper = ticker.strip().upper()
+                    # Cache for future lookups
+                    TICKER_CACHE[cik_padded] = ticker_upper
+                    return ticker_upper
+
+            # Check "ticker" string field
+            if "ticker" in data and data["ticker"]:
+                ticker = data["ticker"]
+                if isinstance(ticker, str) and len(ticker) <= 10:
+                    ticker_upper = ticker.strip().upper()
+                    TICKER_CACHE[cik_padded] = ticker_upper
+                    return ticker_upper
+
         return ""
-    except:
+
+    except Exception as e:
         return ""
 
 def get_options_volume(ticker: str) -> int:
@@ -322,11 +383,17 @@ def get_options_volume(ticker: str) -> int:
     Returns:
         Average daily options volume, or 0 if unavailable
     """
-    if not ticker:
+    if not ticker or not ticker.strip():
+        return 0
+
+    # Validate ticker format (basic check)
+    ticker = ticker.strip().upper()
+    if not ticker.replace('.', '').replace('-', '').isalnum():
         return 0
 
     try:
         import yfinance as yf
+        import pandas as pd
 
         # Get stock data
         stock = yf.Ticker(ticker)
@@ -335,7 +402,7 @@ def get_options_volume(ticker: str) -> int:
         try:
             # Get available expiration dates
             exp_dates = stock.options
-            if not exp_dates:
+            if not exp_dates or len(exp_dates) == 0:
                 return 0
 
             # Get the nearest expiration date
@@ -344,14 +411,22 @@ def get_options_volume(ticker: str) -> int:
             # Get option chain for nearest expiration
             opt_chain = stock.option_chain(nearest_exp)
 
-            # Calculate total volume from calls and puts
-            calls_volume = opt_chain.calls['volume'].sum() if 'volume' in opt_chain.calls else 0
-            puts_volume = opt_chain.puts['volume'].sum() if 'volume' in opt_chain.puts else 0
+            # Calculate total volume from calls and puts, handling NaN
+            calls_volume = 0
+            puts_volume = 0
 
-            total_volume = int(calls_volume + puts_volume)
-            return total_volume
+            if 'volume' in opt_chain.calls.columns:
+                calls_sum = opt_chain.calls['volume'].sum()
+                calls_volume = 0 if pd.isna(calls_sum) else int(calls_sum)
 
-        except:
+            if 'volume' in opt_chain.puts.columns:
+                puts_sum = opt_chain.puts['volume'].sum()
+                puts_volume = 0 if pd.isna(puts_sum) else int(puts_sum)
+
+            total_volume = calls_volume + puts_volume
+            return max(0, total_volume)  # Ensure non-negative
+
+        except Exception as inner_e:
             # If options data unavailable, return 0
             return 0
 
@@ -361,7 +436,7 @@ def get_options_volume(ticker: str) -> int:
 
 def find_exhibit_99_1(cik: str, accession: str, filing_url: str) -> Optional[str]:
     """
-    Parse filing document to find Exhibit 99.1 PDF URL
+    Parse filing document to find Exhibit 99.1 URL using multiple strategies
 
     Args:
         cik: Company CIK number
@@ -369,92 +444,131 @@ def find_exhibit_99_1(cik: str, accession: str, filing_url: str) -> Optional[str
         filing_url: URL to the filing page
 
     Returns:
-        Direct URL to Exhibit 99.1 PDF or None if not found
+        Direct URL to Exhibit 99.1 or None if not found
     """
     try:
         rate_limit()
 
+        # Remove any dashes if present
+        accession_clean = accession.replace('-', '')
+
         # Construct the filing detail page URL
-        # Format: https://www.sec.gov/Archives/edgar/data/CIK/ACCESSION/ACCESSION-index.htm
-        accession_with_dashes = f"{accession[:10]}-{accession[10:12]}-{accession[12:]}"
-        index_url = f"{SEC_BASE_URL}/Archives/edgar/data/{cik}/{accession}/{accession_with_dashes}-index.htm"
+        if len(accession_clean) >= 18:
+            # Standard format: 0001234567-24-000123 -> 0001234567-24-000123
+            accession_with_dashes = f"{accession_clean[:10]}-{accession_clean[10:12]}-{accession_clean[12:]}"
+        else:
+            accession_with_dashes = accession_clean
 
-        # Try the index page first
-        response = requests.get(index_url, headers=get_sec_headers(), timeout=30)
-
-        # If index page doesn't work, try alternative URLs
-        if response.status_code != 200:
-            # Try without -index.htm
-            index_url = f"{SEC_BASE_URL}/Archives/edgar/data/{cik}/{accession}/{accession_with_dashes}.txt"
-            response = requests.get(index_url, headers=get_sec_headers(), timeout=30)
-
-        if response.status_code != 200:
-            # Try the filing_url directly
-            response = requests.get(filing_url, headers=get_sec_headers(), timeout=30)
-
-        if response.status_code != 200:
-            return None
-
-        content = response.text
-
-        # Look for Exhibit 99.1 references
-        # Pattern matches various formats: "99.1", "99 1", "ex99-1", "ex99_1", etc.
-        exhibit_patterns = [
-            # Match exhibit links in table rows
-            r'<tr[^>]*>.*?<td[^>]*>.*?99\.1.*?</td>.*?<a[^>]+href="([^"]+)"',
-            r'<tr[^>]*>.*?<td[^>]*>.*?ex(?:hibit)?\s*99\.1.*?</td>.*?<a[^>]+href="([^"]+)"',
-            # Match direct links with exhibit text
-            r'<a[^>]+href="([^"]+)"[^>]*>.*?ex(?:hibit)?[\s_-]?99[\s._-]1',
-            r'<a[^>]+href="([^"]+)"[^>]*>.*?99[\s._-]1',
-            # Match filename patterns
-            r'href="([^"]*ex99[\-_]?1[^"]*\.(?:htm|html|pdf|txt))"',
-            r'href="([^"]*ex99[\-_]?01[^"]*\.(?:htm|html|pdf|txt))"',
-            # Match with description containing 99.1
-            r'<a[^>]+href="([^"]+)"[^>]*>\s*99\.1\s*</a>',
+        # Try multiple URL formats
+        urls_to_try = [
+            f"{SEC_BASE_URL}/Archives/edgar/data/{cik}/{accession_clean}/{accession_with_dashes}-index.htm",
+            f"{SEC_BASE_URL}/Archives/edgar/data/{cik}/{accession_clean}/{accession_with_dashes}-index.html",
+            f"{SEC_BASE_URL}/cgi-bin/viewer?action=view&cik={cik}&accession_number={accession_with_dashes}&xbrl_type=v",
+            filing_url  # Fallback to provided URL
         ]
 
-        found_urls = []
+        content = None
+        successful_url = None
 
-        for pattern in exhibit_patterns:
+        for url in urls_to_try:
+            try:
+                response = requests.get(url, headers=get_sec_headers(), timeout=30)
+                if response.status_code == 200:
+                    content = response.text
+                    successful_url = url
+                    break
+            except:
+                continue
+
+        if not content:
+            return None
+
+        # Strategy 1: Parse HTML table structure
+        # Most 8-K index pages have a table with exhibit numbers and links
+        table_patterns = [
+            # Table row with exhibit number and link
+            r'<tr[^>]*>.*?<td[^>]*>\s*(?:Exhibit\s+)?99\.1\s*</td>.*?<td[^>]*>.*?<a[^>]+href=["\']([^"\']+)["\']',
+            r'<tr[^>]*>.*?<td[^>]*>\s*99\.1\s*</td>.*?<a[^>]+href=["\']([^"\']+)["\']',
+            # Row with EX-99.1 format
+            r'<tr[^>]*>.*?<td[^>]*>\s*EX-99\.1\s*</td>.*?<a[^>]+href=["\']([^"\']+)["\']',
+        ]
+
+        for pattern in table_patterns:
             matches = re.findall(pattern, content, re.IGNORECASE | re.DOTALL)
             for match in matches:
-                # Convert relative URL to absolute
-                if match.startswith('/'):
-                    doc_url = f"{SEC_BASE_URL}{match}"
-                elif not match.startswith('http'):
-                    doc_url = f"{SEC_BASE_URL}/Archives/edgar/data/{cik}/{accession}/{match}"
-                else:
-                    doc_url = match
+                doc_url = normalize_url(match, cik, accession_clean)
+                if is_valid_document_url(doc_url):
+                    return doc_url
 
-                # Verify it's a document (htm, html, pdf, txt)
-                if any(ext in doc_url.lower() for ext in ['.htm', '.html', '.pdf', '.txt']):
-                    # Avoid duplicates
-                    if doc_url not in found_urls:
-                        found_urls.append(doc_url)
+        # Strategy 2: Look for direct exhibit links with 99.1 in the text
+        link_text_patterns = [
+            # Link with 99.1 in text
+            r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>[^<]*?(?:Exhibit\s+)?99\.1[^<]*?</a>',
+            r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>[^<]*?EX-99\.1[^<]*?</a>',
+            # Link followed by 99.1 description
+            r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>[^<]*?</a>[^<]*?99\.1',
+        ]
 
-        # Return the first match (most likely to be correct)
-        if found_urls:
-            return found_urls[0]
+        for pattern in link_text_patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE | re.DOTALL)
+            for match in matches:
+                doc_url = normalize_url(match, cik, accession_clean)
+                if is_valid_document_url(doc_url):
+                    return doc_url
 
-        # If no matches found with patterns, try searching the raw content
-        # Look for lines containing "99.1" and extract nearby URLs
-        lines_with_991 = [line for line in content.split('\n') if '99.1' in line or '99 1' in line]
-        for line in lines_with_991:
-            url_matches = re.findall(r'href="([^"]+\.(?:htm|html|pdf|txt))"', line, re.IGNORECASE)
-            for match in url_matches:
-                if match.startswith('/'):
-                    doc_url = f"{SEC_BASE_URL}{match}"
-                elif not match.startswith('http'):
-                    doc_url = f"{SEC_BASE_URL}/Archives/edgar/data/{cik}/{accession}/{match}"
-                else:
-                    doc_url = match
-                return doc_url
+        # Strategy 3: Look for filename patterns (ex99-1, ex991, etc.)
+        filename_patterns = [
+            r'href=["\']([^"\']*(?:ex|exhibit)[-_]?99[-_\.]1[^"\']*?\.(?:htm|html|pdf|txt))["\']',
+            r'href=["\']([^"\']*(?:ex|exhibit)[-_]?9901[^"\']*?\.(?:htm|html|pdf|txt))["\']',
+            r'href=["\']([^"\']*d\d+dex991[^"\']*?\.(?:htm|html|pdf|txt))["\']',  # d123456dex991.htm format
+        ]
+
+        for pattern in filename_patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE)
+            for match in matches:
+                doc_url = normalize_url(match, cik, accession_clean)
+                if is_valid_document_url(doc_url):
+                    return doc_url
+
+        # Strategy 4: Search for any mention of 99.1 and nearby links
+        lines = content.split('\n')
+        for i, line in enumerate(lines):
+            if '99.1' in line or '99 1' in line or 'EX-99.1' in line.upper():
+                # Check current line and next 3 lines for links
+                check_lines = lines[i:min(i+4, len(lines))]
+                for check_line in check_lines:
+                    url_matches = re.findall(r'href=["\']([^"\']+\.(?:htm|html|pdf|txt))["\']', check_line, re.IGNORECASE)
+                    for match in url_matches:
+                        doc_url = normalize_url(match, cik, accession_clean)
+                        if is_valid_document_url(doc_url):
+                            return doc_url
 
         return None
 
     except Exception as e:
-        # Don't print errors for each filing - too noisy
         return None
+
+def normalize_url(url: str, cik: str, accession: str) -> str:
+    """Convert relative URLs to absolute URLs"""
+    if url.startswith('http'):
+        return url
+    elif url.startswith('/'):
+        return f"{SEC_BASE_URL}{url}"
+    else:
+        return f"{SEC_BASE_URL}/Archives/edgar/data/{cik}/{accession}/{url}"
+
+def is_valid_document_url(url: str) -> bool:
+    """Check if URL looks like a valid document"""
+    if not url:
+        return False
+    url_lower = url.lower()
+    # Must be a document file
+    if not any(ext in url_lower for ext in ['.htm', '.html', '.pdf', '.txt']):
+        return False
+    # Exclude index pages and XML files
+    if 'index.htm' in url_lower or '.xml' in url_lower:
+        return False
+    return True
 
 # ============================================================================
 # CSV EXPORT
@@ -468,6 +582,10 @@ def write_to_csv(data: List[Dict], filename: str):
         data: List of filing dictionaries
         filename: Output CSV filename
     """
+    if not data:
+        print(f"\n⚠️  No data to write to CSV")
+        return
+
     fieldnames = [
         "Company Name",
         "CIK Number",
@@ -484,20 +602,23 @@ def write_to_csv(data: List[Dict], filename: str):
             writer.writeheader()
 
             for row in data:
+                # Sanitize data to prevent CSV injection or formatting issues
                 writer.writerow({
-                    "Company Name": row.get("company_name", ""),
-                    "CIK Number": row.get("cik", ""),
-                    "Ticker Symbol": row.get("ticker", ""),
-                    "Options Volume": row.get("options_volume", 0),
-                    "Filing Date": row.get("filing_date", ""),
-                    "Exhibit 99.1 URL": row.get("exhibit_url", ""),
-                    "Filing Accession Number": row.get("accession", "")
+                    "Company Name": str(row.get("company_name", "")).replace('\n', ' ').replace('\r', ''),
+                    "CIK Number": str(row.get("cik", "")).strip(),
+                    "Ticker Symbol": str(row.get("ticker", "")).strip().upper(),
+                    "Options Volume": int(row.get("options_volume", 0)),
+                    "Filing Date": str(row.get("filing_date", "")).strip(),
+                    "Exhibit 99.1 URL": str(row.get("exhibit_url", "")).strip(),
+                    "Filing Accession Number": str(row.get("accession", "")).strip()
                 })
 
         print(f"\n✓ Successfully wrote {len(data)} records to {filename}")
 
     except Exception as e:
         print(f"\n✗ Error writing CSV file: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 # ============================================================================
@@ -526,21 +647,21 @@ def process_single_filing(filing: Dict, idx: int, total: int) -> Optional[Dict]:
     )
 
     if exhibit_url:
-        # Get ticker symbol (required for options volume check)
+        # Get ticker symbol
         ticker = get_ticker_from_cik(filing['cik'])
 
-        if not ticker:
-            # Skip if no ticker found (can't check options volume)
-            if idx % 20 == 0:
-                print(f"  [{idx}/{total}] ✗ {company_name_short} (no ticker)")
-            return None
-
-        # Get options volume
-        options_volume = get_options_volume(ticker)
-
-        # Filter by minimum options volume
-        if options_volume >= MIN_OPTIONS_VOLUME:
-            print(f"  [{idx}/{total}] ✓ {ticker} - {company_name_short} (Options Vol: {options_volume:,})")
+        # If options filtering is disabled (MIN_OPTIONS_VOLUME = 0), skip ticker requirement
+        if MIN_OPTIONS_VOLUME == 0:
+            # No filtering - include all filings with Exhibit 99.1
+            options_volume = 0
+            if ticker:
+                # Try to get options volume if ticker available (for informational purposes)
+                options_volume = get_options_volume(ticker)
+                print(f"  [{idx}/{total}] ✓ {ticker} - {company_name_short} (Options Vol: {options_volume:,})")
+            else:
+                # No ticker, but still include since filtering is disabled
+                ticker = "N/A"
+                print(f"  [{idx}/{total}] ✓ [No Ticker] - {company_name_short}")
 
             return {
                 "company_name": filing['company_name'],
@@ -552,10 +673,34 @@ def process_single_filing(filing: Dict, idx: int, total: int) -> Optional[Dict]:
                 "options_volume": options_volume
             }
         else:
-            # Filtered out due to low options volume
-            if idx % 20 == 0:
-                print(f"  [{idx}/{total}] ✗ {ticker} (Options Vol: {options_volume:,} < {MIN_OPTIONS_VOLUME:,})")
-            return None
+            # Options filtering is enabled - ticker is required
+            if not ticker:
+                # Skip if no ticker found (can't check options volume)
+                if idx % 20 == 0:
+                    print(f"  [{idx}/{total}] ✗ {company_name_short} (no ticker)")
+                return None
+
+            # Get options volume
+            options_volume = get_options_volume(ticker)
+
+            # Filter by minimum options volume
+            if options_volume >= MIN_OPTIONS_VOLUME:
+                print(f"  [{idx}/{total}] ✓ {ticker} - {company_name_short} (Options Vol: {options_volume:,})")
+
+                return {
+                    "company_name": filing['company_name'],
+                    "cik": filing['cik'],
+                    "ticker": ticker,
+                    "filing_date": parse_date(filing['filing_date']),
+                    "exhibit_url": exhibit_url,
+                    "accession": filing['accession'],
+                    "options_volume": options_volume
+                }
+            else:
+                # Filtered out due to low options volume
+                if idx % 20 == 0:
+                    print(f"  [{idx}/{total}] ✗ {ticker} (Options Vol: {options_volume:,} < {MIN_OPTIONS_VOLUME:,})")
+                return None
     else:
         # Only print occasionally to reduce noise
         if idx % 50 == 0:
@@ -573,6 +718,16 @@ def main():
     print("=" * 70)
     print()
 
+    # Warn if MAX_WORKERS is too high (could violate SEC rate limits)
+    if MAX_WORKERS > 10:
+        print(f"⚠️  WARNING: MAX_WORKERS={MAX_WORKERS} may exceed SEC rate limits")
+        print(f"   Recommended: MAX_WORKERS <= 8 for reliable operation")
+        print()
+
+    # Load ticker cache at startup (one-time operation)
+    load_ticker_cache()
+    print()
+
     # Step 1: Fetch recent 8-K filings
     filings = get_recent_8k_filings(days_back=DAYS_BACK)
 
@@ -585,7 +740,9 @@ def main():
     print("This may take a few minutes depending on the number of filings...\n")
 
     results = []
+    results_lock = threading.Lock()  # Thread-safe access to results list
     processed_count = 0
+    count_lock = threading.Lock()  # Thread-safe counter
 
     # Use ThreadPoolExecutor for parallel processing
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -597,40 +754,66 @@ def main():
 
         # Collect results as they complete
         for future in as_completed(future_to_filing):
-            processed_count += 1
+            with count_lock:
+                processed_count += 1
+                current_count = processed_count
+                current_results = len(results)
+
             try:
                 result = future.result()
                 if result:
-                    results.append(result)
+                    with results_lock:
+                        results.append(result)
             except Exception as e:
                 # Silently skip errors in individual filings
                 pass
 
             # Print progress update every 50 filings
-            if processed_count % 50 == 0:
-                print(f"  Progress: {processed_count}/{len(filings)} filings processed, {len(results)} with Exhibit 99.1")
+            if current_count % 50 == 0:
+                with results_lock:
+                    print(f"  Progress: {current_count}/{len(filings)} filings processed, {len(results)} with Exhibit 99.1")
 
     # Step 3: Write results to CSV
     print(f"\n{'=' * 70}")
     print(f"FILTERING SUMMARY:")
     print(f"  Total 8-K filings: {len(filings)}")
-    print(f"  Filings with Exhibit 99.1 and options volume >= {MIN_OPTIONS_VOLUME:,}: {len(results)}")
-    print(f"  Success rate: {len(results)/len(filings)*100:.1f}%")
+
+    if MIN_OPTIONS_VOLUME == 0:
+        print(f"  Filings with Exhibit 99.1 (no filtering): {len(results)}")
+    else:
+        print(f"  Filings with Exhibit 99.1 and options volume >= {MIN_OPTIONS_VOLUME:,}: {len(results)}")
+
+    if len(filings) > 0:
+        print(f"  Success rate: {len(results)/len(filings)*100:.1f}%")
+    else:
+        print(f"  Success rate: N/A")
 
     if results:
         # Sort results by options volume (highest first)
         results.sort(key=lambda x: x.get('options_volume', 0), reverse=True)
 
         write_to_csv(results, OUTPUT_FILENAME)
-        print(f"\nTop 5 results by options volume:")
+
+        if MIN_OPTIONS_VOLUME == 0:
+            print(f"\nTop 5 results (no filtering applied):")
+        else:
+            print(f"\nTop 5 results by options volume:")
+
         for i, result in enumerate(results[:5], 1):
-            print(f"\n  {i}. {result['ticker']} - {result['company_name']}")
-            print(f"     Options Volume: {result.get('options_volume', 0):,}")
+            ticker_display = result.get('ticker', 'N/A')
+            options_vol = result.get('options_volume', 0)
+
+            print(f"\n  {i}. {ticker_display} - {result['company_name']}")
+            if MIN_OPTIONS_VOLUME > 0 or options_vol > 0:
+                print(f"     Options Volume: {options_vol:,}")
             print(f"     Filing Date: {result['filing_date']}")
             print(f"     URL: {result['exhibit_url'][:60]}...")
     else:
-        print(f"\nNo filings found with Exhibit 99.1 and options volume >= {MIN_OPTIONS_VOLUME:,}.")
-        print(f"Consider lowering MIN_OPTIONS_VOLUME in the configuration.")
+        if MIN_OPTIONS_VOLUME == 0:
+            print(f"\nNo filings found with Exhibit 99.1.")
+        else:
+            print(f"\nNo filings found with Exhibit 99.1 and options volume >= {MIN_OPTIONS_VOLUME:,}.")
+            print(f"Consider lowering MIN_OPTIONS_VOLUME in the configuration.")
 
     print("\n" + "=" * 70)
     print("Processing complete!")
