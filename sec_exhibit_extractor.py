@@ -9,6 +9,7 @@ import csv
 import time
 import re
 import json
+import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import sys
@@ -19,13 +20,15 @@ import threading
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-DAYS_BACK = 14  # How many days to look back for 8-K filings
+DAYS_BACK = 2  # How many days to look back for 8-K filings
 OUTPUT_FILENAME = "exhibit_99_1_filings.csv"
 USER_AGENT = "Mozilla/5.0 (SEC Exhibit Extractor; brendanwbhan@gmail.com)"  # REQUIRED by SEC
 REQUEST_DELAY = 0.11  # 0.11 seconds = ~9 requests/second (under SEC limit)
 MAX_RETRIES = 3
 MAX_WORKERS = 8  # Number of parallel threads for processing filings
 MIN_OPTIONS_VOLUME = 0  # Minimum daily options volume to include stock
+ENABLE_CLAUDE_ANALYSIS = True  # Enable Claude AI analysis of Exhibit 99.1 content
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")  # Set via environment variable
 
 # SEC EDGAR API endpoints
 SEC_BASE_URL = "https://www.sec.gov"
@@ -434,6 +437,77 @@ def get_options_volume(ticker: str) -> int:
         # If any error occurs, return 0 (assume no options or unavailable)
         return 0
 
+def analyze_exhibit_with_claude(exhibit_url: str, company_name: str) -> str:
+    """
+    Fetch Exhibit 99.1 content and analyze it with Claude AI for private offerings
+
+    Args:
+        exhibit_url: URL to the Exhibit 99.1 document
+        company_name: Name of the company
+
+    Returns:
+        Analysis summary or error message
+    """
+    if not ENABLE_CLAUDE_ANALYSIS or not ANTHROPIC_API_KEY:
+        return "Analysis disabled"
+
+    try:
+        # Fetch the document content
+        rate_limit()
+        response = requests.get(exhibit_url, headers=get_sec_headers(), timeout=30)
+
+        if response.status_code != 200:
+            return "Unable to fetch document"
+
+        content = response.text
+
+        # Strip HTML tags for cleaner analysis
+        # Simple regex to remove HTML (not perfect but good enough)
+        text_content = re.sub(r'<[^>]+>', ' ', content)
+        text_content = re.sub(r'\s+', ' ', text_content).strip()
+
+        # Limit content to avoid token limits (~100k chars = ~25k tokens)
+        if len(text_content) > 100000:
+            text_content = text_content[:100000] + "... [truncated]"
+
+        # Initialize Anthropic client
+        from anthropic import Anthropic
+        client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        # Analyze with Claude
+        message = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=500,
+            temperature=0,
+            messages=[{
+                "role": "user",
+                "content": f"""Analyze this SEC Exhibit 99.1 filing for {company_name} and determine if it mentions any private offering, PIPE transaction, private placement, or similar equity financing.
+
+Document content:
+{text_content}
+
+Provide a concise summary (2-3 sentences max) focusing ONLY on:
+1. Is there a private offering/PIPE/placement mentioned? (Yes/No)
+2. If yes, what are the key terms? (amount, price, investors)
+3. If no private offering, what is the main topic of this filing?
+
+Be specific and factual. Use numbers when available."""
+            }]
+        )
+
+        # Extract the response
+        analysis = message.content[0].text if message.content else "No analysis available"
+
+        # Clean up and limit length for CSV
+        analysis = analysis.replace('\n', ' ').replace('\r', ' ').strip()
+        if len(analysis) > 500:
+            analysis = analysis[:497] + "..."
+
+        return analysis
+
+    except Exception as e:
+        return f"Analysis error: {str(e)[:50]}"
+
 def find_exhibit_99_1(cik: str, accession: str, filing_url: str) -> Optional[str]:
     """
     Parse filing document to find Exhibit 99.1 URL using multiple strategies
@@ -593,7 +667,8 @@ def write_to_csv(data: List[Dict], filename: str):
         "Options Volume",
         "Filing Date",
         "Exhibit 99.1 URL",
-        "Filing Accession Number"
+        "Filing Accession Number",
+        "Claude Analysis"
     ]
 
     try:
@@ -610,7 +685,8 @@ def write_to_csv(data: List[Dict], filename: str):
                     "Options Volume": int(row.get("options_volume", 0)),
                     "Filing Date": str(row.get("filing_date", "")).strip(),
                     "Exhibit 99.1 URL": str(row.get("exhibit_url", "")).strip(),
-                    "Filing Accession Number": str(row.get("accession", "")).strip()
+                    "Filing Accession Number": str(row.get("accession", "")).strip(),
+                    "Claude Analysis": str(row.get("claude_analysis", "Not analyzed")).replace('\n', ' ').replace('\r', '')
                 })
 
         print(f"\n✓ Successfully wrote {len(data)} records to {filename}")
@@ -657,9 +733,15 @@ def process_single_filing(filing: Dict, idx: int, total: int) -> Optional[Dict]:
             if ticker:
                 # Try to get options volume if ticker available (for informational purposes)
                 options_volume = get_options_volume(ticker)
+
+            # Analyze with Claude if enabled
+            analysis = "Not analyzed"
+            if ENABLE_CLAUDE_ANALYSIS and ANTHROPIC_API_KEY:
+                analysis = analyze_exhibit_with_claude(exhibit_url, filing['company_name'])
+
+            if ticker:
                 print(f"  [{idx}/{total}] ✓ {ticker} - {company_name_short} (Options Vol: {options_volume:,})")
             else:
-                # No ticker, but still include since filtering is disabled
                 ticker = "N/A"
                 print(f"  [{idx}/{total}] ✓ [No Ticker] - {company_name_short}")
 
@@ -670,7 +752,8 @@ def process_single_filing(filing: Dict, idx: int, total: int) -> Optional[Dict]:
                 "filing_date": parse_date(filing['filing_date']),
                 "exhibit_url": exhibit_url,
                 "accession": filing['accession'],
-                "options_volume": options_volume
+                "options_volume": options_volume,
+                "claude_analysis": analysis
             }
         else:
             # Options filtering is enabled - ticker is required
@@ -685,6 +768,11 @@ def process_single_filing(filing: Dict, idx: int, total: int) -> Optional[Dict]:
 
             # Filter by minimum options volume
             if options_volume >= MIN_OPTIONS_VOLUME:
+                # Analyze with Claude if enabled
+                analysis = "Not analyzed"
+                if ENABLE_CLAUDE_ANALYSIS and ANTHROPIC_API_KEY:
+                    analysis = analyze_exhibit_with_claude(exhibit_url, filing['company_name'])
+
                 print(f"  [{idx}/{total}] ✓ {ticker} - {company_name_short} (Options Vol: {options_volume:,})")
 
                 return {
@@ -694,7 +782,8 @@ def process_single_filing(filing: Dict, idx: int, total: int) -> Optional[Dict]:
                     "filing_date": parse_date(filing['filing_date']),
                     "exhibit_url": exhibit_url,
                     "accession": filing['accession'],
-                    "options_volume": options_volume
+                    "options_volume": options_volume,
+                    "claude_analysis": analysis
                 }
             else:
                 # Filtered out due to low options volume

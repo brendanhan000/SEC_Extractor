@@ -4,6 +4,7 @@
 This Python script automatically searches all public company 8-K filings from the last 30 days, identifies those containing Exhibit 99.1 (typically press releases), filters by options trading volume (≥10,000), and extracts key information into a CSV file.
 
 ## Features
+- ✓ **AI-Powered Analysis** - Claude AI analyzes Exhibit 99.1 content for private offerings/PIPE transactions
 - ✓ **Options Volume Filter** - Automatically excludes stocks with options volume < 10,000
 - ✓ **Parallel Processing** - Uses multi-threading to process up to 8 filings simultaneously
 - ✓ **Comprehensive Coverage** - Searches SEC daily index files for complete 8-K filing data
@@ -19,6 +20,7 @@ This Python script automatically searches all public company 8-K filings from th
 - Python 3.8 or higher
 - `requests` library (HTTP requests to SEC)
 - `yfinance` library (options volume data)
+- `anthropic` library (Claude AI document analysis - optional)
 
 ## Installation
 
@@ -33,6 +35,22 @@ This Python script automatically searches all public company 8-K filings from th
    USER_AGENT = "Mozilla/5.0 (Your Name; your.email@example.com)"
    ```
    The SEC requires this for compliance with their fair access policy.
+
+3. **Set up Claude AI (OPTIONAL):**
+   To enable AI-powered analysis of Exhibit 99.1 content:
+   ```bash
+   export ANTHROPIC_API_KEY="your-api-key-here"
+   ```
+   Or add to your `.bashrc`/`.zshrc`:
+   ```bash
+   echo 'export ANTHROPIC_API_KEY="your-api-key-here"' >> ~/.zshrc
+   source ~/.zshrc
+   ```
+
+   To disable Claude analysis, set in `sec_exhibit_extractor.py`:
+   ```python
+   ENABLE_CLAUDE_ANALYSIS = False
+   ```
 
 ## Usage
 
@@ -50,6 +68,7 @@ OUTPUT_FILENAME = "exhibit_99_1_filings.csv"  # Output file name
 REQUEST_DELAY = 0.11  # Delay between requests (stay under 10/sec)
 MAX_WORKERS = 8  # Number of parallel threads (default: 8)
 MIN_OPTIONS_VOLUME = 10000  # Minimum daily options volume (default: 10,000)
+ENABLE_CLAUDE_ANALYSIS = True  # Enable/disable AI analysis (default: True)
 ```
 
 ### Testing with Smaller Date Range
@@ -71,11 +90,13 @@ The script generates a CSV file with the following columns:
 | Filing Date | Date filed in YYYY-MM-DD format | 2024-11-15 |
 | Exhibit 99.1 URL | Direct link to the document | https://www.sec.gov/... |
 | Filing Accession Number | Unique filing identifier | 0000320193-24-000123 |
+| Claude Analysis | AI summary of filing content | Yes - $50M PIPE at $12.50/share... |
 
 ### Sample Output
 ```csv
-Company Name,CIK Number,Ticker Symbol,Options Volume,Filing Date,Exhibit 99.1 URL,Filing Accession Number
-Apple Inc.,0000320193,AAPL,125430,2024-11-15,https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/ex99-1.htm,0000320193-24-000123
+Company Name,CIK Number,Ticker Symbol,Options Volume,Filing Date,Exhibit 99.1 URL,Filing Accession Number,Claude Analysis
+Apple Inc.,0000320193,AAPL,125430,2024-11-15,https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/ex99-1.htm,0000320193-24-000123,No - Quarterly earnings release reporting $89.5B revenue for Q3 2024
+Acme Biotech Inc.,0001234567,ABIO,15200,2024-11-14,https://www.sec.gov/Archives/edgar/data/1234567/000123456724000045/ex99-1.htm,0001234567-24-000045,Yes - $50M private placement at $12.50/share with institutional investors including lead investor HealthCare Ventures
 ```
 
 ## Expected Runtime
@@ -88,6 +109,7 @@ With **parallel processing** (8 workers) and **options volume filtering**:
 Runtime varies based on:
 - Number of 8-K filings in the date range (weekdays only)
 - Options volume lookups (adds ~1-2 seconds per filing with Exhibit 99.1)
+- Claude AI analysis (adds ~2-4 seconds per filing when enabled)
 - Network speed and SEC server response times
 - Yahoo Finance API availability for options data
 - Time of day (slower during market hours: 9:30 AM - 4:00 PM ET)
@@ -111,6 +133,8 @@ The script uses **parallel processing** to significantly speed up extraction:
 - **Maximum coverage:** Set `DAYS_BACK = 60` or `90` for more filings
 - **Adjust options filter:** Lower `MIN_OPTIONS_VOLUME = 5000` for more results
 - **Disable filtering:** Set `MIN_OPTIONS_VOLUME = 0` to include all stocks
+- **Faster processing:** Set `ENABLE_CLAUDE_ANALYSIS = False` to skip AI analysis
+- **Reduce costs:** Set `ENABLE_CLAUDE_ANALYSIS = False` to avoid Anthropic API charges
 
 ## Limitations
 
@@ -128,7 +152,11 @@ The script uses **parallel processing** to significantly speed up extraction:
 
 7. **Weekend/Holiday Coverage:** Daily index files only available for business days (Mon-Fri, excluding SEC holidays).
 
-8. **Processing Time:** Options volume lookups add ~1-2 seconds per filing, significantly increasing total runtime.
+8. **Processing Time:** Options volume lookups add ~1-2 seconds per filing, Claude AI analysis adds ~2-4 seconds per filing.
+
+9. **Claude AI Analysis:** Requires valid ANTHROPIC_API_KEY environment variable. Analysis quality depends on document length and complexity. Very long documents are truncated to 100,000 characters.
+
+10. **API Costs:** Claude AI analysis incurs per-request costs via Anthropic API. Typical cost: ~$0.002-0.005 per filing analyzed.
 
 ## Troubleshooting
 
@@ -156,13 +184,23 @@ The script uses **parallel processing** to significantly speed up extraction:
 - **Cause:** Rate limiting or temporary unavailability of options data
 - **Solution:** Retry later or reduce `MAX_WORKERS` to avoid overwhelming the API
 
+### Claude Analysis Shows "Analysis disabled" or "Not analyzed"
+- **Cause:** Missing ANTHROPIC_API_KEY environment variable or ENABLE_CLAUDE_ANALYSIS=False
+- **Solution:** Set the API key: `export ANTHROPIC_API_KEY="your-key"` and ensure ENABLE_CLAUDE_ANALYSIS=True
+
+### Claude Analysis Errors
+- **Cause:** Invalid API key, network issues, or API rate limiting
+- **Solution:** Verify API key is correct, check network connectivity, or reduce MAX_WORKERS to slow down analysis requests
+
 ## Best Practices
 
-1. **Initial Testing:** Start with `DAYS_BACK = 7` to verify everything works
+1. **Initial Testing:** Start with `DAYS_BACK = 7` and `ENABLE_CLAUDE_ANALYSIS = False` to verify everything works
 2. **Off-Peak Hours:** Run during evenings/weekends for faster results
 3. **User-Agent Compliance:** Always include valid contact information
 4. **Backup Data:** Consider running periodically and archiving CSV outputs
 5. **Rate Limiting:** Never modify request delays to be faster than 0.1 seconds
+6. **API Cost Management:** Monitor Anthropic API usage and set daily limits if processing large date ranges
+7. **Test Claude Analysis:** Run a small batch first to verify API key is working and review output quality
 
 ## SEC EDGAR Resources
 
