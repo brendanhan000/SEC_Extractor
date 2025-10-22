@@ -10,17 +10,20 @@ import time
 import re
 import json
 import os
+import socket
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import sys
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-DAYS_BACK = 2  # How many days to look back for 8-K filings
+DAYS_BACK = 3  # How many days to look back for 8-K filings
 OUTPUT_FILENAME = "exhibit_99_1_filings.csv"
 USER_AGENT = "Mozilla/5.0 (SEC Exhibit Extractor; brendanwbhan@gmail.com)"  # REQUIRED by SEC
 REQUEST_DELAY = 0.11  # 0.11 seconds = ~9 requests/second (under SEC limit)
@@ -45,6 +48,38 @@ TICKER_CACHE_LOADED = False
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
+
+def check_internet_connectivity():
+    """Check if we have internet connectivity and can resolve SEC domains"""
+    domains_to_check = ["www.sec.gov", "data.sec.gov", "8.8.8.8"]
+
+    for domain in domains_to_check:
+        try:
+            # Try to resolve the domain
+            socket.gethostbyname(domain)
+            return True
+        except socket.gaierror:
+            continue
+
+    return False
+
+def get_requests_session():
+    """Create a requests session with retry logic and proper configuration"""
+    session = requests.Session()
+
+    # Configure retry strategy
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+    return session
 
 def get_sec_headers():
     """Return required headers for SEC EDGAR API requests"""
@@ -167,8 +202,19 @@ def get_filings_from_rss_feed() -> List[Dict]:
     }
 
     try:
+        # Check connectivity first
+        if not check_internet_connectivity():
+            print(f"  ⚠️  DNS/Network error: Cannot resolve SEC domains")
+            print(f"     Please check your internet connection and DNS settings")
+            print(f"     You may need to:")
+            print(f"       1. Check your network connection")
+            print(f"       2. Verify your DNS settings (try 8.8.8.8 or 1.1.1.1)")
+            print(f"       3. Check if a firewall is blocking SEC domains")
+            return filings
+
         rate_limit()
-        response = requests.get(url, params=params, headers=get_sec_headers(), timeout=30)
+        session = get_requests_session()
+        response = session.get(url, params=params, headers=get_sec_headers(), timeout=30)
         response.raise_for_status()
 
         content = response.text
@@ -181,6 +227,14 @@ def get_filings_from_rss_feed() -> List[Dict]:
             if filing_data:
                 filings.append(filing_data)
 
+    except socket.gaierror as e:
+        print(f"  ⚠️  DNS resolution error: {e}")
+        print(f"     Cannot resolve www.sec.gov - check your DNS settings")
+    except requests.exceptions.ConnectionError as e:
+        print(f"  ⚠️  Connection error: {e}")
+        print(f"     Cannot connect to SEC servers - check your internet connection")
+    except requests.exceptions.Timeout:
+        print(f"  ⚠️  Request timeout: SEC servers not responding")
     except Exception as e:
         print(f"  Error fetching RSS feed: {e}")
 
@@ -221,7 +275,8 @@ def get_filings_from_daily_index(days_back: int = 30) -> List[Dict]:
 
         try:
             rate_limit()
-            response = requests.get(index_url, headers=get_sec_headers(), timeout=30)
+            session = get_requests_session()
+            response = session.get(index_url, headers=get_sec_headers(), timeout=30)
 
             if response.status_code == 200:
                 lines = response.text.split('\n')
@@ -806,6 +861,20 @@ def main():
     print("SEC EDGAR 8-K Exhibit 99.1 Extractor (Parallel Mode)")
     print("=" * 70)
     print()
+
+    # Check internet connectivity first
+    print("Checking internet connectivity and DNS resolution...")
+    if not check_internet_connectivity():
+        print("\n❌ ERROR: Cannot connect to SEC servers")
+        print("   Please check:")
+        print("   1. Your internet connection is active")
+        print("   2. DNS settings are correct (try using 8.8.8.8 or 1.1.1.1)")
+        print("   3. No firewall is blocking SEC domains (www.sec.gov, data.sec.gov)")
+        print("\n   You can test DNS resolution manually with:")
+        print("   nslookup www.sec.gov")
+        print("   ping www.sec.gov")
+        sys.exit(1)
+    print("✓ Internet connectivity check passed\n")
 
     # Warn if MAX_WORKERS is too high (could violate SEC rate limits)
     if MAX_WORKERS > 10:
